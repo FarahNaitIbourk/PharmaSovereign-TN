@@ -1,34 +1,69 @@
-"""
-Django 6 REST API Layer (Django REST Framework + SimpleJWT)
-Exposes:
-- POST /api/auth/register/ and POST /api/auth/login/ (Custom JWT claims: role, governorate, wallet_address)
-- GET/POST /api/v1/cooperatives/, /api/v1/telemetry/, /api/v1/anomalies/, /api/v1/zk-receipts/
-- POST /api/v1/darja-intent/ (Ingests Tunisian Darja voice transcript or text and triggers LangGraph loop)
-"""
+
 from rest_framework import serializers, viewsets, permissions, status
-from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.views import APIView
 from rest_framework.response import Response
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework_simplejwt.views import TokenObtainPairView
 
-from .models import (
+from backend.tunisovereign_core.models import (
     StakeholderUser,
-    CooperativeUnit,
-    ResourceNodePlot,
-    TelemetryReading,
-    AnomalyAndForecastEvent,
-    AgentLoopExecution,
-    OnChainZKReceipt,
+    PharmaFacility,
+    Medicine,
+    MedicineBatch,
+    Shipment,
+    ColdChainSensor,
+    ColdChainReading,
+    BatchScan,
+    PharmaAnomaly,
+    DrugAuthenticityReceipt,
 )
-from agent.langgraph_agent import run_sovereign_agent_loop
 
 
-# ============================================================================
-# 1. Custom SimpleJWT Claims Serializer (Role, Governorate & Wallet Address)
-# ============================================================================
+# -------------------------
+# AUTHENTIFICATION
+# -------------------------
+
+class RegisterSerializer(serializers.ModelSerializer):
+    password = serializers.CharField(write_only=True, min_length=8)
+
+    class Meta:
+        model = StakeholderUser
+        fields = [
+            "id", "username", "password", "email",
+            "first_name", "last_name", "governorate",
+            "preferred_dialect",
+        ]
+
+    def create(self, validated_data):
+        return StakeholderUser.objects.create_user(
+            **validated_data,
+            role=StakeholderUser.Role.COOP_MEMBER,
+        )
+
+
+class RegisterView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = RegisterSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+
+        return Response(
+            {
+                "message": "Compte créé avec succès.",
+                "user_id": user.id,
+                "username": user.username,
+                "role": user.role,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
 class SovereignTokenObtainPairSerializer(TokenObtainPairSerializer):
     @classmethod
-    def get_token(cls, user: StakeholderUser):
+    def get_token(cls, user):
         token = super().get_token(user)
         token["role"] = user.role
         token["governorate"] = user.governorate
@@ -41,125 +76,332 @@ class SovereignTokenObtainPairView(TokenObtainPairView):
     serializer_class = SovereignTokenObtainPairSerializer
 
 
-# ============================================================================
-# 2. Role-Based Permission Classes
-# ============================================================================
-class IsCoopMember(permissions.BasePermission):
-    def has_permission(self, request, view):
-        return bool(request.user and request.user.is_authenticated)
+# -------------------------
+# PERMISSIONS
+# -------------------------
 
 
-class IsRegionalAuditor(permissions.BasePermission):
+
+class PharmaRolePermission(permissions.BasePermission):
+
     def has_permission(self, request, view):
-        return bool(
-            request.user
-            and request.user.is_authenticated
-            and request.user.role in ("REGIONAL_AUDITOR", "NATIONAL_ADMIN", "AGENT_SERVICE")
+        if not request.user or not request.user.is_authenticated:
+            return False
+
+        role = request.user.role
+
+        # Consultation autorisée aux quatre rôles.
+        if request.method in permissions.SAFE_METHODS:
+            return role in [
+                StakeholderUser.Role.COOP_MEMBER,
+                StakeholderUser.Role.REGIONAL_AUDITOR,
+                StakeholderUser.Role.NATIONAL_ADMIN,
+                StakeholderUser.Role.AGENT_SERVICE,
+            ]
+
+        # Seuls ces rôles peuvent effectuer des écritures.
+        if request.method == "DELETE":
+            return role == StakeholderUser.Role.NATIONAL_ADMIN
+
+        return role in [
+            StakeholderUser.Role.REGIONAL_AUDITOR,
+            StakeholderUser.Role.NATIONAL_ADMIN,
+            StakeholderUser.Role.AGENT_SERVICE,
+        ]
+
+    def has_object_permission(self, request, view, obj):
+        role = request.user.role
+
+        # L'administrateur national possède un accès complet.
+        if role == StakeholderUser.Role.NATIONAL_ADMIN:
+            return True
+
+        # Les suppressions sont réservées à l'administrateur national.
+        if request.method == "DELETE":
+            return False
+
+        # Les utilisateurs régionaux sont limités à leur gouvernorat.
+        if role in [
+            StakeholderUser.Role.COOP_MEMBER,
+            StakeholderUser.Role.REGIONAL_AUDITOR,
+        ]:
+            governorate = self.get_object_governorate(obj)
+
+            # Les objets sans gouvernorat (ex. médicament)
+            # sont des ressources nationales communes.
+            if governorate is None:
+                return True
+
+            return governorate == request.user.governorate
+
+        return True
+
+    @staticmethod
+    def get_object_governorate(obj):
+        if hasattr(obj, "governorate"):
+            return obj.governorate
+
+        if hasattr(obj, "assigned_governorate"):
+            return obj.assigned_governorate
+
+        if hasattr(obj, "facility"):
+            return obj.facility.governorate
+
+        if hasattr(obj, "destination"):
+            return obj.destination.governorate
+
+        if hasattr(obj, "shipment"):
+            return PharmaRolePermission.get_object_governorate(
+                obj.shipment
+            )
+
+        if hasattr(obj, "batch"):
+            return PharmaRolePermission.get_object_governorate(
+                obj.batch
+            )
+
+        return None
+    
+    def filter_queryset(self, request, queryset, view):
+        role = request.user.role
+
+        # Administrateur et agent technique : accès national.
+        if role in [
+            StakeholderUser.Role.NATIONAL_ADMIN,
+            StakeholderUser.Role.AGENT_SERVICE,
+        ]:
+            return queryset
+
+        model = queryset.model
+
+        # Ressources nationales communes.
+        if model == Medicine:
+            return queryset
+
+        if model == PharmaFacility:
+            return queryset.filter(
+                governorate=request.user.governorate
+            )
+
+        if model == MedicineBatch:
+            return queryset.filter(
+                assigned_governorate=request.user.governorate
+            )
+
+        if model == Shipment:
+            return queryset.filter(
+                batch__assigned_governorate=request.user.governorate
+            )
+
+        if model == BatchScan:
+            return queryset.filter(
+                batch__assigned_governorate=request.user.governorate
+            )
+
+        if model == ColdChainSensor:
+            return queryset.filter(
+                shipment__batch__assigned_governorate=request.user.governorate
+            )
+
+        if model == ColdChainReading:
+            return queryset.filter(
+                shipment__batch__assigned_governorate=request.user.governorate
+            )
+
+        if model == PharmaAnomaly:
+            return queryset.filter(
+                batch__assigned_governorate=request.user.governorate
+            )
+
+        if model == DrugAuthenticityReceipt:
+            return queryset.filter(
+                batch__assigned_governorate=request.user.governorate
+            )
+
+        return queryset.none()
+
+
+
+# -------------------------
+# SERIALIZERS PHARMACEUTIQUES
+# -------------------------
+
+class PharmaFacilitySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PharmaFacility
+        fields = "__all__"
+
+
+class MedicineSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Medicine
+        fields = "__all__"
+
+
+class MedicineBatchSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MedicineBatch
+        fields = "__all__"
+
+
+class ShipmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Shipment
+        fields = "__all__"
+
+
+class ColdChainSensorSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ColdChainSensor
+        fields = "__all__"
+
+
+class ColdChainReadingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ColdChainReading
+        fields = "__all__"
+
+
+class BatchScanSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BatchScan
+        fields = "__all__"
+        read_only_fields = ["scanned_by", "scanned_at", "is_authorized"]
+
+
+class PharmaAnomalySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PharmaAnomaly
+        fields = "__all__"
+
+
+class DrugAuthenticityReceiptSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DrugAuthenticityReceipt
+        fields = "__all__"
+
+
+# -------------------------
+# VIEWSETS REST
+# -------------------------
+
+
+class PharmaFacilityViewSet(viewsets.ModelViewSet):
+    queryset = PharmaFacility.objects.all().order_by("name")
+    serializer_class = PharmaFacilitySerializer
+    permission_classes = [PharmaRolePermission]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        return self.permission_classes[0]().filter_queryset(
+            self.request, queryset, self
+        )
+
+class MedicineViewSet(viewsets.ModelViewSet):
+    queryset = Medicine.objects.all().order_by("name")
+    serializer_class = MedicineSerializer
+    permission_classes = [PharmaRolePermission]
+
+class MedicineBatchViewSet(viewsets.ModelViewSet):
+    queryset = MedicineBatch.objects.select_related("medicine").all()
+    serializer_class = MedicineBatchSerializer
+    permission_classes = [PharmaRolePermission]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        return self.permission_classes[0]().filter_queryset(
+            self.request, queryset, self
+        )
+    
+class ShipmentViewSet(viewsets.ModelViewSet):
+    queryset = Shipment.objects.select_related(
+        "batch", "origin", "destination"
+    ).all().order_by("-created_at")
+    serializer_class = ShipmentSerializer
+    permission_classes = [PharmaRolePermission]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        return self.permission_classes[0]().filter_queryset(
+            self.request, queryset, self
+        )
+    
+
+class ColdChainSensorViewSet(viewsets.ModelViewSet):
+    queryset = ColdChainSensor.objects.select_related("shipment").all()
+    serializer_class = ColdChainSensorSerializer
+    permission_classes = [PharmaRolePermission]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        return self.permission_classes[0]().filter_queryset(
+            self.request, queryset, self
+        )
+
+    
+
+
+class ColdChainReadingViewSet(viewsets.ModelViewSet):
+    queryset = ColdChainReading.objects.select_related(
+        "sensor", "shipment"
+    ).all().order_by("-recorded_at")
+    serializer_class = ColdChainReadingSerializer
+    permission_classes = [PharmaRolePermission]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        return self.permission_classes[0]().filter_queryset(
+            self.request, queryset, self
         )
 
 
-class IsNationalAdmin(permissions.BasePermission):
-    def has_permission(self, request, view):
-        return bool(
-            request.user
-            and request.user.is_authenticated
-            and request.user.role == "NATIONAL_ADMIN"
+class BatchScanViewSet(viewsets.ModelViewSet):
+    queryset = BatchScan.objects.select_related(
+        "batch", "facility", "scanned_by"
+    ).all()
+    serializer_class = BatchScanSerializer
+    permission_classes = [PharmaRolePermission]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        return self.permission_classes[0]().filter_queryset(
+            self.request, queryset, self
         )
 
+    def perform_create(self, serializer):
+        batch = serializer.validated_data["batch"]
+        facility = serializer.validated_data["facility"]
 
-# ============================================================================
-# 3. Model Serializers
-# ============================================================================
-class CooperativeUnitSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = CooperativeUnit
-        fields = "__all__"
+        authorized = (
+            batch.assigned_governorate == facility.governorate
+        )
 
+        serializer.save(
+            scanned_by=self.request.user,
+            is_authorized=authorized
+        )
 
-class ResourceNodePlotSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = ResourceNodePlot
-        fields = "__all__"
+class PharmaAnomalyViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = PharmaAnomaly.objects.select_related(
+        "batch", "shipment", "reading"
+    ).all().order_by("-detected_at")
+    serializer_class = PharmaAnomalySerializer
+    permission_classes = [PharmaRolePermission]
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        return self.permission_classes[0]().filter_queryset(
+            self.request, queryset, self
+        )
+class DrugAuthenticityReceiptViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = DrugAuthenticityReceipt.objects.select_related(
+        "batch", "agent_execution"
+    ).all().order_by("-created_at")
+    serializer_class = DrugAuthenticityReceiptSerializer
+    permission_classes = [PharmaRolePermission]
 
-class TelemetryReadingSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = TelemetryReading
-        fields = "__all__"
-
-
-class AnomalyAndForecastEventSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = AnomalyAndForecastEvent
-        fields = "__all__"
-
-
-class OnChainZKReceiptSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = OnChainZKReceipt
-        fields = "__all__"
-
-
-class AgentLoopExecutionSerializer(serializers.ModelSerializer):
-    zk_receipt = OnChainZKReceiptSerializer(read_only=True)
-
-    class Meta:
-        model = AgentLoopExecution
-        fields = "__all__"
-
-
-# ============================================================================
-# 4. DRF ViewSets & Darja Intent Webhook
-# ============================================================================
-class CooperativeUnitViewSet(viewsets.ModelViewSet):
-    queryset = CooperativeUnit.objects.all().order_by("-created_at")
-    serializer_class = CooperativeUnitSerializer
-    permission_classes = [IsCoopMember]
-
-
-class TelemetryReadingViewSet(viewsets.ModelViewSet):
-    queryset = TelemetryReading.objects.select_related("node").order_by("-timestamp")
-    serializer_class = TelemetryReadingSerializer
-    permission_classes = [IsCoopMember]
-
-
-class AnomalyAndForecastEventViewSet(viewsets.ModelViewSet):
-    queryset = AnomalyAndForecastEvent.objects.select_related("node").order_by("-detected_at")
-    serializer_class = AnomalyAndForecastEventSerializer
-    permission_classes = [IsRegionalAuditor]
-
-
-class OnChainZKReceiptViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = OnChainZKReceipt.objects.select_related("agent_execution").order_by("-block_number")
-    serializer_class = OnChainZKReceiptSerializer
-    permission_classes = [IsCoopMember]
-
-
-@api_view(["POST"])
-@permission_classes([permissions.AllowAny])
-def darja_intent_webhook(request):
-    """
-    POST /api/v1/darja-intent/
-    Accepts a Tunisian Darja transcript and sensor telemetry snapshot,
-    executes the stateful LangGraph loop + FastMCP tool + ZK settlement skill,
-    and returns the structured execution trace and on-chain receipt.
-    """
-    payload = request.data
-    state_out = run_sovereign_agent_loop({
-        "thread_id": payload.get("thread_id", "drf-darja-webhook-001"),
-        "node_code": payload.get("node_code", "KAS-SBEITLA-PLOT-04"),
-        "darja_input": payload.get(
-            "darja_input",
-            "Ya khouya fi Kasserine el sonda habtet 28% wel skhana 37 darja, lazmenna maa urgent!",
-        ),
-        "moisture_pct": float(payload.get("moisture_pct", 28.4)),
-        "temp_c": float(payload.get("temp_c", 37.2)),
-        "flow_l_min": float(payload.get("flow_l_min", 182.0)),
-        "parsed_intent": {},
-        "anomaly_report": {},
-        "mcp_allocation": {},
-        "zk_receipt": {},
-        "skills_trace": [],
-        "final_explanation": "",
-    })
-    return Response(state_out, status=status.HTTP_200_OK)
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        return self.permission_classes[0]().filter_queryset(
+            self.request, queryset, self
+        )
